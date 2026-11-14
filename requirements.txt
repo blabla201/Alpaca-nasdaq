@@ -1,0 +1,7 @@
+streamlit>=1.50
+alpaca-py
+pandas
+numpy
+plotly
+requests
+streamlit-autorefresh
