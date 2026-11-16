@@ -2,7 +2,7 @@
 Lab Nasdaq Bot - tek dosya (app.py)
 - iPhone'da Streamlit uygulaması olarak çalışır
 - Aynı dosya GitHub Actions'ta arka plan botu olarak da çalışır:  python app.py --worker
-Varsayılan: PAPER (sanal para). Canlı için ALPACA_PAPER=false secret'ı gerekir.
+Yalnızca analiz ve sanal test. Otomatik emirler kapalıdır.
 """
 import os
 import sys
@@ -32,7 +32,7 @@ DEFAULTS = dict(
     take=4.0,           # kâr-al %
     daily_loss=5.0,     # günlük zarar limiti (dolar) - dolunca bot durur
     flatten_min=10,     # kapanıştan kaç dk önce hepsini sat
-    strategies=["EMA9+VWAP", "Gerçek Kırılım", "FVG %50", "Balina Bölgesi"],
+    strategies=["Gerçek Kırılım", "EMA20/50 Pullback"],
 )
 # ===================================================================
 
@@ -78,7 +78,7 @@ def indicators(df):
     df["ema9"] = df.close.ewm(span=9, adjust=False).mean()
     df["ema20"] = df.close.ewm(span=20, adjust=False).mean()
     df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
-    df["vwap"] = (tp * df.volume).groupby(d).cumsum() / df.volume.groupby(d).cumsum()
+    df["vwap"] = (tp * df.volume).groupby(d).cumsum() / df.volume.groupby(d).cumsum().replace(0, np.nan)
     rng = (df.high - df.low).replace(0, np.nan)
     df["delta"] = (df.volume * (2 * df.close - df.high - df.low) / rng).fillna(0)  # hacim deltası (tahmini)
     df["cdelta"] = df["delta"].groupby(d).cumsum()
@@ -92,13 +92,14 @@ def get_bars(sym, days=10):
                            start=datetime.now(timezone.utc) - timedelta(days=days), feed=DataFeed.IEX)
     try:
         df = dc().get_stock_bars(req).df
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(f"Alpaca IEX veri hatası ({sym}): {type(e).__name__}: {e}") from e
     if df is None or df.empty:
         return None
     df = df.loc[sym].copy()
     df.index = df.index.tz_convert("America/New_York")
     df = df.between_time("09:30", "15:59")
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return indicators(df) if len(df) > 30 else None
 
 
@@ -198,38 +199,45 @@ STRATS = {"EMA9+VWAP": s_ema_vwap, "Gerçek Kırılım": s_break, "FVG %50": s_f
 
 
 # ======================= BACKTEST =======================
-def backtest(df, sig, stop, take, hold=24, cost=0.001):
-    o, h, l, c = df.open.values, df.high.values, df.low.values, df.close.values
+def backtest(df, sig, stop, take, hold=24, cost=0.002):
+    """Kapanmış sinyal mumundan SONRAKİ mum açılışı; çift dokunuşta stop önce.
+    cost: toplam gidiş-dönüş komisyon + kayma varsayımı (varsayılan %0,20).
+    Sonuçlar IEX mumlarından yapılan yaklaşık simülasyondur, gerçekleşmiş işlem değildir.
+    """
+    o, h, l, c = [df[x].to_numpy(dtype=float) for x in ("open", "high", "low", "close")]
     idx, dates = df.index, df.index.date
-    sv = sig.fillna(False).values
-    n = len(df)
+    sv = sig.reindex(idx).fillna(False).to_numpy(dtype=bool)
     trades = []
     i = 0
-    while i < n - 1:
-        if not sv[i]:
+    while i < len(df)-1:
+        if not sv[i] or dates[i+1] != dates[i]:
             i += 1
             continue
         j = i + 1
-        if dates[j] != dates[i]:
+        entry = o[j]
+        if not np.isfinite(entry) or entry <= 0:
             i += 1
             continue
-        entry = o[j]
-        sl, tp = entry * (1 - stop / 100), entry * (1 + take / 100)
+        sl, tp = entry * (1-stop/100), entry * (1+take/100)
         k = j
         while True:
+            # Açılış gap'i stopun altındaysa stop fiyatından gerçekleştiğini varsayma.
+            if o[k] <= sl:
+                ex, reason = o[k], "stop gap"
+                break
             if l[k] <= sl:
-                ex = sl
+                ex, reason = sl, "stop"
                 break
             if h[k] >= tp:
-                ex = tp
+                ex, reason = tp, "hedef"
                 break
-            if k == n - 1 or k - j >= hold or dates[k + 1] != dates[k]:
-                ex = c[k]
+            if k == len(df)-1 or k-j >= hold or dates[k+1] != dates[k]:
+                ex, reason = c[k], "süre/seans"
                 break
             k += 1
-        trades.append((idx[j], entry, ex, ex / entry - 1 - cost))
-        i = k + 1
-    return pd.DataFrame(trades, columns=["zaman", "giriş", "çıkış", "getiri"])
+        trades.append((idx[j], float(entry), float(ex), float(ex/entry-1-cost), reason))
+        i = k+1
+    return pd.DataFrame(trades, columns=["zaman", "giriş", "çıkış", "getiri", "çıkış nedeni"])
 
 
 def stats(t):
@@ -259,6 +267,8 @@ def analyze(sym, strategies, stop, take):
     age = (now_ny - (df.index[-1] + pd.Timedelta(minutes=1))).total_seconds() / 60
     if age > 2 or age < 0:
         return None
+    if (df.index[-1] - df.index[-2]).total_seconds() > 120:
+        return None
     last = df.iloc[-1]
     price = float(last.close)
     active, pfs = [], []
@@ -283,8 +293,8 @@ def analyze(sym, strategies, stop, take):
     score = len(active) * 30 + min(rvol, 3) * 10 + (15 if trend else 0) + (10 if last.cdelta > 0 else 0) \
         + (min(float(np.mean(pfs)), 3) * 5 if pfs else 0)
     # Kırılım doğrulanmadıysa alış tavsiyesi verme.
-    confirmed = bool(s_break(df).iloc[-1]) or bool(s_trend_pullback(df).iloc[-1])
-    state = "TEYİTLİ SİNYAL / SANAL TEST" if confirmed else "İZLE — SİNYAL YOK"
+    confirmed = any(bool(STRATS[n](df).iloc[-1]) for n in ("Gerçek Kırılım", "EMA20/50 Pullback") if n in strategies)
+    state = "TEYİTLİ / SANAL TEST" if confirmed and rvol >= 1.3 and trend else "İZLE — TEYİT YOK"
     return {"Durum": state, "Veri yaşı dk": round(age, 1), "Hisse": sym, "Skor": min(100, round(score)), "Fiyat": round(price, 2), "Sinyal": ", ".join(active) or "-",
             "Hacim x": round(rvol, 1), "Kırılım": round(float(break_level(df).iloc[-1]), 2),
             "Alış": round(price, 2), "Stop": round(price * (1 - stop / 100), 2),
@@ -297,7 +307,7 @@ def scan(wl, strategies, stop, take):
     for s in wl:
         try:
             r = analyze(s, list(strategies), stop, take)
-        except Exception:
+        except Exception as e:
             r = None
         if r:
             rows.append(r)
@@ -305,7 +315,7 @@ def scan(wl, strategies, stop, take):
 
 
 def radar(wl):
-    """Ani hareket radarı (5 dk mum): henüz fırlamamış ama yükselme belirtisi gösterenler."""
+    """Ani hareket radarı (1 dk mum): henüz fırlamamış ama yükselme belirtisi gösterenler."""
     rows = []
     for s in wl:
         df = get_bars(s, 5)
@@ -318,10 +328,12 @@ def radar(wl):
         age = (now_ny - (df.index[-1] + pd.Timedelta(minutes=1))).total_seconds()/60
         last = df.iloc[-1]
         day = df[df.index.date == df.index[-1].date()]
-        move15 = (last.close / df.close.iloc[-4] - 1) * 100
+        # Tam 15 dakika önceki kapanış, aynı seans ve yeterli bar varsa.
+        today = day.tail(16)
+        move15 = (last.close / today.close.iloc[0] - 1) * 100 if len(today) == 16 and (today.index[-1]-today.index[0]).total_seconds() == 900 else float("nan")
         from_open = (last.close / day.open.iloc[0] - 1) * 100
         rvol = float(np.nan_to_num(last.volume / df.volma.iloc[-1])) if df.volma.iloc[-1] else 0.0
-        ok = (last.close > last.vwap and last.close > last.ema9 and last.cdelta > 0
+        ok = (np.isfinite(move15) and last.close > last.vwap and last.close > last.ema9 and last.cdelta > 0
               and rvol >= 1.8 and 0.3 <= move15 <= 3 and from_open < 6)
         status = ("⚪ Piyasa kapalı / eski veri" if age > 2 else
                   ("🟢 İzle — ön aday" if ok else ("🔴 Zaten yükselmiş" if from_open >= 6 else "⚪ İzle")))
@@ -336,51 +348,8 @@ def parse_wl(s):
 
 
 def run_cycle(cfg):
-    if not bool(secret("ENABLE_PAPER_ORDERS", False)):
-        return ["GÜVENLİ MOD: Otomatik emirler kapalı. ENABLE_PAPER_ORDERS=true yalnızca sanal emirleri açar."]
-    log = []
-    t = tc()
-    clock = t.get_clock()
-    if not clock.is_open:
-        return ["Piyasa kapalı."]
-    acct = t.get_account()
-    pos = t.get_all_positions()
-    if float(acct.last_equity) - float(acct.equity) >= cfg["daily_loss"]:
-        if pos:
-            t.close_all_positions(cancel_orders=True)
-            notify("Günlük zarar limiti doldu. Tüm pozisyonlar kapatıldı, bot durdu.")
-        return ["Günlük zarar limiti doldu. Yeni işlem yok."]
-    if clock.next_close - clock.timestamp < timedelta(minutes=cfg["flatten_min"]):
-        if pos:
-            t.close_all_positions(cancel_orders=True)
-            notify("Kapanışa yakın: pozisyonlar kapatıldı.")
-        return ["Kapanışa yakın: pozisyonlar kapatıldı, yeni işlem yok."]
-    held = {p.symbol for p in pos}
-    pending = {o.symbol for o in t.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))}
-    df = scan(tuple(parse_wl(cfg["watchlist"])), tuple(cfg["strategies"]), cfg["stop"], cfg["take"])
-    if df.empty:
-        return ["Veri alınamadı."]
-    for _, r in df.iterrows():
-        if r.get("Durum") != "TEYİTLİ SİNYAL / SANAL TEST":
-            continue
-        if len(held) >= cfg["max_pos"]:
-            break
-        if r["Sinyal"] == "-" or r["Hisse"] in held or r["Hisse"] in pending:
-            continue
-        qty = int(cfg["budget"] // r["Fiyat"])
-        if qty < 1:
-            log.append(f"{r['Hisse']}: bütçe yetmiyor ({r['Fiyat']}$)")
-            continue
-        t.submit_order(MarketOrderRequest(
-            symbol=r["Hisse"], qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=r["Hedef"]),
-            stop_loss=StopLossRequest(stop_price=r["Stop"])))
-        held.add(r["Hisse"])
-        msg = f"AL {r['Hisse']} x{qty} ~{r['Fiyat']}$ | stop {r['Stop']} | hedef {r['Hedef']} | {r['Sinyal']}"
-        log.append(msg)
-        notify(msg)
-    return log or ["Sinyal yok, işlem yapılmadı."]
+    """Emir gönderme hiçbir koşulda etkin değil; analiz amaçlı."""
+    return ["GÜVENLİ MOD: Otomatik alım/satım devre dışı. Yalnızca sanal test."]
 
 
 def worker():
@@ -424,7 +393,8 @@ def ui():
         st.error("ALPACA_KEY ve ALPACA_SECRET Streamlit Secrets'a eklenmeli.")
         st.stop()
 
-    st.title("📈 Lab Nasdaq")
+    st.title("📈 Lab Nasdaq v6.6")
+    st.warning("IEX tek borsa verisidir; tüm NASDAQ hacmi değildir. Buradaki sinyaller gerçek alım önerisi değil, test adaylarıdır.")
     st.caption(("🧪 SANAL (paper) hesap" if PAPER else "⚠️ CANLI hesap") + " • Yatırım tavsiyesi değildir")
 
     with st.expander("⚙️ Ayarlar"):
@@ -457,10 +427,10 @@ def ui():
         with st.spinner("Hisseler analiz ediliyor..."):
             sc = scan(tuple(wl), tuple(cfg["strategies"]), stop, take)
         if sc.empty:
-            st.info("Veri yok.")
+            st.info("Canlı aday yok: piyasa kapalı, veri eski veya son mumda koşullar sağlanmadı. Radar sekmesinde son kapanış verilerini görebilirsin.")
         else:
             for _, r in sc.head(3).iterrows():
-                if r.get("Durum") == "TEYİTLİ SİNYAL / SANAL TEST":
+                if r.get("Durum") == "TEYİTLİ / SANAL TEST":
                     st.success(f"**{r['Hisse']}** (sanal test) skor {r['Skor']} • Alış {r['Alış']} • Stop {r['Stop']} • "
                                f"Hedef {r['Hedef']} • Kırılım {r['Kırılım']}\n\n{r['Neden']}")
             st.dataframe(sc, hide_index=True)
@@ -471,8 +441,13 @@ def ui():
         if df is None:
             st.info("Veri yok.")
         else:
+            # En son tamamlanmamış mumu dışla, testte ileriye bakma.
+            now_ny = pd.Timestamp.now(tz="America/New_York")
+            if df.index[-1] + pd.Timedelta(minutes=1) > now_ny:
+                df = df.iloc[:-1]
             rows = [{"Strateji": n, **stats(backtest(df, f(df), stop, take))} for n, f in STRATS.items()]
             st.dataframe(pd.DataFrame(rows), hide_index=True)
+            st.caption("Kâr faktörü 1 altındaysa strateji testte zarar etti. 30 işlem altındaki örnekler karar için yetersizdir. Test maliyeti toplam %0,20 varsayılmıştır; gerçek spread/kayma ölçülmemiştir.")
             pick = st.selectbox("Grafikte göster", list(STRATS))
             sig = STRATS[pick](df)
             lv = float(break_level(df).iloc[-1])
@@ -529,34 +504,15 @@ def ui():
             st.error(f"Hesap okunamadı: {e}")
 
     with t_bot:
-        st.write("Bot, **Sıralama** sinyallerine göre bracket emri (stop + hedef borsada) gönderir.")
-        auto = st.toggle("Otomatik mod (sayfa açıkken her 5 dk)")
-        st.session_state.setdefault("log", [])
-        go_now = st.button("▶️ Şimdi tara ve işlem yap")
-        if auto:
-            from streamlit_autorefresh import st_autorefresh
-            n = st_autorefresh(interval=300_000, key="tick")
-            if n != st.session_state.get("last_tick"):
-                st.session_state.last_tick = n
-                go_now = True
-        else:
-            st.session_state.pop("last_tick", None)
-        if go_now:
-            try:
-                for line in run_cycle(cfg):
-                    st.session_state.log.insert(0, f"{datetime.now():%H:%M} {line}")
-            except Exception as e:
-                st.session_state.log.insert(0, f"{datetime.now():%H:%M} Hata: {e}")
-        c1, c2 = st.columns(2)
-        if c1.button("🛑 Hepsini sat (acil)"):
-            tc().close_all_positions(cancel_orders=True)
-            st.session_state.log.insert(0, f"{datetime.now():%H:%M} Acil kapatma yapıldı.")
-            notify("Acil kapatma: tüm pozisyonlar satıldı.")
-        if c2.button("🔔 Test bildirimi"):
-            notify("Test: Lab Nasdaq bildirimi çalışıyor.")
-            st.toast("Gönderildi (NTFY_TOPIC ayarlıysa)")
-        st.text("\n".join(st.session_state.log[:30]) or "Kayıt yok.")
-        st.caption("Otomatik mod, iPhone ekranı kilitlenince/sayfa kapanınca durur. Kesintisiz için GitHub Actions kullan.")
+        st.subheader("🛡️ Güvenli test modu")
+        st.info("Otomatik emir verme kapalı. Önce yeterli sayıda tarihsel ve ileriye dönük testte maliyet sonrası pozitif sonuç gerekli.")
+        if st.button("Sanal sinyal taramasını çalıştır"):
+            sc = scan(tuple(wl), tuple(cfg["strategies"]), stop, take)
+            if sc.empty:
+                st.warning("Güncel teyitli sinyal yok veya piyasa kapalı.")
+            else:
+                st.dataframe(sc, hide_index=True)
+        st.caption("Gerçek alım/satım için Midas'a otomatik bağlantı yoktur. Alpaca hesabına emir gönderilmez.")
 
 
 if "--worker" in sys.argv:
