@@ -46,17 +46,17 @@ def secret(key, default=None):
     return os.environ.get(key, default)
 
 
-PAPER = str(secret("ALPACA_PAPER", "true")).lower() != "false"
+PAPER = True  # Güvenlik: yalnızca sanal hesap
 
 
 @st.cache_resource
 def tc():
-    return TradingClient(secret("ALPACA_KEY"), secret("ALPACA_SECRET"), paper=PAPER)
+    return TradingClient(secret("ALPACA_KEY", secret("ALPACA_API_KEY")), secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY")), paper=PAPER)
 
 
 @st.cache_resource
 def dc():
-    return StockHistoricalDataClient(secret("ALPACA_KEY"), secret("ALPACA_SECRET"))
+    return StockHistoricalDataClient(secret("ALPACA_KEY", secret("ALPACA_API_KEY")), secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY")))
 
 
 def notify(msg):
@@ -84,9 +84,9 @@ def indicators(df):
     return df
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_bars(sym, days=10):
-    req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+    req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame(1, TimeFrameUnit.Minute),
                            start=datetime.now(timezone.utc) - timedelta(days=days), feed=DataFeed.IEX)
     try:
         df = dc().get_stock_bars(req).df
@@ -220,12 +220,21 @@ def analyze(sym, strategies, stop, take):
     df = get_bars(sym, 10)
     if df is None or len(df) < 60:
         return None
+    # Henüz kapanmamış veya eski mumdan canlı işlem sinyali üretme.
+    now_ny = pd.Timestamp.now(tz="America/New_York")
+    if df.index[-1] + pd.Timedelta(minutes=1) > now_ny:
+        df = df.iloc[:-1]
+    if len(df) < 60:
+        return None
+    age = (now_ny - (df.index[-1] + pd.Timedelta(minutes=1))).total_seconds() / 60
+    if age > 2 or age < 0:
+        return None
     last = df.iloc[-1]
     price = float(last.close)
     active, pfs = [], []
     for name in strategies:
         sig = STRATS[name](df)
-        if sig.iloc[-3:].any():
+        if bool(sig.iloc[-1]):
             active.append(name)
         s = stats(backtest(df, sig, stop, take))
         if s["İşlem"] >= 3:
@@ -243,13 +252,16 @@ def analyze(sym, strategies, stop, take):
         why.append(f"Hacim {rvol:.1f}x")
     score = len(active) * 30 + min(rvol, 3) * 10 + (15 if trend else 0) + (10 if last.cdelta > 0 else 0) \
         + (min(float(np.mean(pfs)), 3) * 5 if pfs else 0)
-    return {"Hisse": sym, "Skor": round(score), "Fiyat": round(price, 2), "Sinyal": ", ".join(active) or "-",
+    # Kırılım doğrulanmadıysa alış tavsiyesi verme.
+    confirmed = bool(s_break(df).iloc[-1])
+    state = "KIRILIM TEYİDİ / SANAL TEST" if confirmed else "İZLE — KIRILIM YOK"
+    return {"Durum": state, "Veri yaşı dk": round(age, 1), "Hisse": sym, "Skor": min(100, round(score)), "Fiyat": round(price, 2), "Sinyal": ", ".join(active) or "-",
             "Hacim x": round(rvol, 1), "Kırılım": round(float(break_level(df).iloc[-1]), 2),
             "Alış": round(price, 2), "Stop": round(price * (1 - stop / 100), 2),
             "Hedef": round(price * (1 + take / 100), 2), "Neden": "; ".join(why) or "Belirgin sinyal yok"}
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def scan(wl, strategies, stop, take):
     rows = []
     for s in wl:
@@ -288,6 +300,8 @@ def parse_wl(s):
 
 
 def run_cycle(cfg):
+    if not bool(secret("ENABLE_PAPER_ORDERS", False)):
+        return ["GÜVENLİ MOD: Otomatik emirler kapalı. ENABLE_PAPER_ORDERS=true yalnızca sanal emirleri açar."]
     log = []
     t = tc()
     clock = t.get_clock()
@@ -311,6 +325,8 @@ def run_cycle(cfg):
     if df.empty:
         return ["Veri alınamadı."]
     for _, r in df.iterrows():
+        if r.get("Durum") != "KIRILIM TEYİDİ / SANAL TEST":
+            continue
         if len(held) >= cfg["max_pos"]:
             break
         if r["Sinyal"] == "-" or r["Hisse"] in held or r["Hisse"] in pending:
@@ -368,7 +384,7 @@ def ui():
             st.session_state.ok = True
             st.rerun()
         st.stop()
-    if not secret("ALPACA_KEY") or not secret("ALPACA_SECRET"):
+    if not secret("ALPACA_KEY", secret("ALPACA_API_KEY")) or not secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY")):
         st.error("ALPACA_KEY ve ALPACA_SECRET Streamlit Secrets'a eklenmeli.")
         st.stop()
 
@@ -391,7 +407,7 @@ def ui():
     t_radar, t_rank, t_lab, t_perf, t_bot = st.tabs(["📡 Radar", "🏆 Sıralama", "🧪 Lab", "📊 Performans", "🤖 Bot"])
 
     with t_radar:
-        st.caption("5 dk mum: hacim artışı + VWAP/EMA9 üstü + pozitif hacim deltası, henüz fırlamamış hisseler")
+        st.caption("1 dk mum: hacim artışı + VWAP/EMA9 üstü + pozitif hacim deltası, henüz fırlamamış hisseler")
         if st.button("Yenile", key="r1"):
             st.cache_data.clear()
         with st.spinner("Taranıyor..."):
@@ -405,8 +421,8 @@ def ui():
             st.info("Veri yok.")
         else:
             for _, r in sc.head(3).iterrows():
-                if r["Sinyal"] != "-":
-                    st.success(f"**{r['Hisse']}** skor {r['Skor']} • Alış {r['Alış']} • Stop {r['Stop']} • "
+                if r.get("Durum") == "KIRILIM TEYİDİ / SANAL TEST":
+                    st.success(f"**{r['Hisse']}** (sanal test) skor {r['Skor']} • Alış {r['Alış']} • Stop {r['Stop']} • "
                                f"Hedef {r['Hedef']} • Kırılım {r['Kırılım']}\n\n{r['Neden']}")
             st.dataframe(sc, hide_index=True)
 
