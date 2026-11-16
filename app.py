@@ -76,6 +76,8 @@ def indicators(df):
     d = df.index.date
     tp = (df.high + df.low + df.close) / 3
     df["ema9"] = df.close.ewm(span=9, adjust=False).mean()
+    df["ema20"] = df.close.ewm(span=20, adjust=False).mean()
+    df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
     df["vwap"] = (tp * df.volume).groupby(d).cumsum() / df.volume.groupby(d).cumsum()
     rng = (df.high - df.low).replace(0, np.nan)
     df["delta"] = (df.volume * (2 * df.close - df.high - df.low) / rng).fillna(0)  # hacim deltası (tahmini)
@@ -164,7 +166,35 @@ def s_whale(df):
     return pd.Series(out, index=df.index)
 
 
-STRATS = {"EMA9+VWAP": s_ema_vwap, "Gerçek Kırılım": s_break, "FVG %50": s_fvg, "Balina Bölgesi": s_whale}
+def s_trend_pullback(df):
+    """1m EMA20>EMA50, prior 1-5 bars touched EMA band, current bullish engulfing."""
+    up = (df.ema20 > df.ema50) & (df.ema20.diff() > 0)
+    band_low = pd.concat([df.ema20, df.ema50], axis=1).min(axis=1)
+    band_high = pd.concat([df.ema20, df.ema50], axis=1).max(axis=1)
+    touched = (df.low <= band_high) & (df.high >= band_low)
+    # Only earlier bars qualify; never use current bar as both pullback and entry.
+    recent = touched.shift(1).rolling(5, min_periods=1).max().fillna(0).astype(bool)
+    prev_bear = df.close.shift(1) < df.open.shift(1)
+    bullish = (df.close > df.open) & prev_bear & (df.open <= df.close.shift(1)) & (df.close >= df.open.shift(1))
+    same_day = df.index.date == pd.Series(df.index.date, index=df.index).shift(1).values
+    return (up & recent & bullish & same_day & (df.close > df.ema20)).fillna(False)
+
+
+def pullback_levels(df, method="Swing"):
+    """Informational long-only entry/stop/2R based on closed bars."""
+    if len(df) < 55: return None
+    entry = float(df.close.iloc[-1])
+    prior = df.iloc[-10:]
+    tr = pd.concat([df.high-df.low, (df.high-df.close.shift(1)).abs(),
+                    (df.low-df.close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = float(tr.rolling(14, min_periods=14).mean().iloc[-1])
+    stop = float(prior.low.min()) if method == "Swing" else entry - 1.5*atr
+    if not (0 < stop < entry):return None
+    return {"Giriş": round(entry,3), "Stop": round(stop,3), "Hedef (2R)": round(entry+2*(entry-stop),3),
+            "Risk %": round(100*(entry-stop)/entry,2)}
+
+
+STRATS = {"EMA9+VWAP": s_ema_vwap, "Gerçek Kırılım": s_break, "FVG %50": s_fvg, "Balina Bölgesi": s_whale, "EMA20/50 Pullback": s_trend_pullback}
 
 
 # ======================= BACKTEST =======================
@@ -253,8 +283,8 @@ def analyze(sym, strategies, stop, take):
     score = len(active) * 30 + min(rvol, 3) * 10 + (15 if trend else 0) + (10 if last.cdelta > 0 else 0) \
         + (min(float(np.mean(pfs)), 3) * 5 if pfs else 0)
     # Kırılım doğrulanmadıysa alış tavsiyesi verme.
-    confirmed = bool(s_break(df).iloc[-1])
-    state = "KIRILIM TEYİDİ / SANAL TEST" if confirmed else "İZLE — KIRILIM YOK"
+    confirmed = bool(s_break(df).iloc[-1]) or bool(s_trend_pullback(df).iloc[-1])
+    state = "TEYİTLİ SİNYAL / SANAL TEST" if confirmed else "İZLE — SİNYAL YOK"
     return {"Durum": state, "Veri yaşı dk": round(age, 1), "Hisse": sym, "Skor": min(100, round(score)), "Fiyat": round(price, 2), "Sinyal": ", ".join(active) or "-",
             "Hacim x": round(rvol, 1), "Kırılım": round(float(break_level(df).iloc[-1]), 2),
             "Alış": round(price, 2), "Stop": round(price * (1 - stop / 100), 2),
@@ -281,6 +311,11 @@ def radar(wl):
         df = get_bars(s, 5)
         if df is None or len(df) < 30:
             continue
+        now_ny = pd.Timestamp.now(tz="America/New_York")
+        if df.index[-1] + pd.Timedelta(minutes=1) > now_ny:
+            df = df.iloc[:-1]
+        if len(df) < 30: continue
+        age = (now_ny - (df.index[-1] + pd.Timedelta(minutes=1))).total_seconds()/60
         last = df.iloc[-1]
         day = df[df.index.date == df.index[-1].date()]
         move15 = (last.close / df.close.iloc[-4] - 1) * 100
@@ -288,7 +323,8 @@ def radar(wl):
         rvol = float(np.nan_to_num(last.volume / df.volma.iloc[-1])) if df.volma.iloc[-1] else 0.0
         ok = (last.close > last.vwap and last.close > last.ema9 and last.cdelta > 0
               and rvol >= 1.8 and 0.3 <= move15 <= 3 and from_open < 6)
-        status = "🟢 Yükselme adayı" if ok else ("🔴 Zaten yükselmiş" if from_open >= 6 else "⚪ İzle")
+        status = ("⚪ Piyasa kapalı / eski veri" if age > 2 else
+                  ("🟢 İzle — ön aday" if ok else ("🔴 Zaten yükselmiş" if from_open >= 6 else "⚪ İzle")))
         rows.append({"Hisse": s, "Durum": status, "Fiyat": round(float(last.close), 2),
                      "15dk %": round(float(move15), 2), "Günlük %": round(float(from_open), 2), "Hacim x": round(rvol, 1)})
     return pd.DataFrame(rows).sort_values("Durum").reset_index(drop=True) if rows else pd.DataFrame()
@@ -325,7 +361,7 @@ def run_cycle(cfg):
     if df.empty:
         return ["Veri alınamadı."]
     for _, r in df.iterrows():
-        if r.get("Durum") != "KIRILIM TEYİDİ / SANAL TEST":
+        if r.get("Durum") != "TEYİTLİ SİNYAL / SANAL TEST":
             continue
         if len(held) >= cfg["max_pos"]:
             break
@@ -412,7 +448,10 @@ def ui():
             st.cache_data.clear()
         with st.spinner("Taranıyor..."):
             rd = radar(wl)
-        st.dataframe(rd, hide_index=True) if not rd.empty else st.info("Veri yok (piyasa kapalı olabilir).")
+        if not rd.empty:
+            st.dataframe(rd, hide_index=True)
+        else:
+            st.info("Veri yok (piyasa kapalı olabilir).")
 
     with t_rank:
         with st.spinner("Hisseler analiz ediliyor..."):
@@ -421,7 +460,7 @@ def ui():
             st.info("Veri yok.")
         else:
             for _, r in sc.head(3).iterrows():
-                if r.get("Durum") == "KIRILIM TEYİDİ / SANAL TEST":
+                if r.get("Durum") == "TEYİTLİ SİNYAL / SANAL TEST":
                     st.success(f"**{r['Hisse']}** (sanal test) skor {r['Skor']} • Alış {r['Alış']} • Stop {r['Stop']} • "
                                f"Hedef {r['Hedef']} • Kırılım {r['Kırılım']}\n\n{r['Neden']}")
             st.dataframe(sc, hide_index=True)
@@ -440,7 +479,12 @@ def ui():
             p = float(df.close.iloc[-1])
             st.plotly_chart(chart(df, sig, [("Kırılım", lv, "#38bdf8"), ("Stop", p * (1 - stop / 100), "#ef4444"),
                                             ("Hedef", p * (1 + take / 100), "#22c55e")]))
-            st.caption("Backtest son 10 gün, 5 dk mum, komisyon+kayma %0,1. Geçmiş sonuç geleceği garanti etmez.")
+            st.caption("Backtest son 10 gün, 1 dk IEX mum; varsayımsal işlem maliyeti %0,1. Geçmiş sonuç geleceği garanti etmez.")
+            if pick == "EMA20/50 Pullback":
+                method = st.radio("Stop yöntemi", ["Swing", "ATR"], horizontal=True)
+                lvls = pullback_levels(df, method)
+                st.write("Son mum için örnek risk planı (yalnızca eğitim):", lvls if lvls else "Geçerli plan yok")
+                st.caption("Sinyal ancak son kapanmış mumda engulfing ve EMA koşulları varsa oluşur; bu tablo canlı alış emri değildir.")
 
     with t_perf:
         try:
