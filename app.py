@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from radar_upgrade import discover_symbols, decision, closed_bars, evaluate_snapshots
+from radar_quality import assess, quote_iex, evaluate_horizons, session_state
 import streamlit as st
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -393,7 +395,7 @@ def ui():
         st.error("ALPACA_KEY ve ALPACA_SECRET Streamlit Secrets'a eklenmeli.")
         st.stop()
 
-    st.title("📈 Lab Nasdaq v6.6")
+    st.title("📈 Lab Nasdaq v6.8 — Doğrulama Radarı")
     st.warning("IEX tek borsa verisidir; tüm NASDAQ hacmi değildir. Buradaki sinyaller gerçek alım önerisi değil, test adaylarıdır.")
     st.caption(("🧪 SANAL (paper) hesap" if PAPER else "⚠️ CANLI hesap") + " • Yatırım tavsiyesi değildir")
 
@@ -409,8 +411,25 @@ def ui():
     cfg = dict(watchlist=wl_txt, budget=budget, max_pos=int(max_pos), stop=stop, take=take,
                daily_loss=dl, flatten_min=DEFAULTS["flatten_min"], strategies=strat or list(STRATS))
     wl = parse_wl(wl_txt)
+    st.subheader("🔎 Dinamik hisse keşfi (deneysel)")
+    st.caption("Seans: " + session_state() + " • Sadece normal seans sinyalleri işlem adayı olarak değerlendirilir.")
+    st.caption("Alpaca en çok işlem görenler ve yükselenler listesi; veri gecikmesi/kapsamı garanti edilmez. En fazla 20 yeni sembol eklenir. Sadece sanal izleme.")
+    if st.button("Yeni adayları keşfet"):
+        with st.spinner("Alpaca tarayıcı listeleri alınıyor..."):
+            found, errors = discover_symbols(secret("ALPACA_KEY", secret("ALPACA_API_KEY")), secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY")))
+        st.session_state['discovered_symbols'] = found
+        st.session_state['discovery_errors'] = errors
+    discovered = st.session_state.get('discovered_symbols', [])
+    if discovered:
+        st.write("Keşfedilen:", ", ".join(discovered))
+    for error in st.session_state.get('discovery_errors', []):
+        st.warning("Keşif erişim sorunu: " + error)
+    use_discovered = st.checkbox("Keşfedilen hisseleri mevcut listeye ekle", value=True)
+    if use_discovered:
+        wl = list(dict.fromkeys(wl + discovered))[:35]
+    st.caption(f"Bu oturumda taranacak hisse sayısı: {len(wl)}. Çok sayıda API isteği nedeniyle tarama yavaşlayabilir.")
 
-    t_radar, t_rank, t_lab, t_perf, t_bot = st.tabs(["📡 Radar", "🏆 Sıralama", "🧪 Lab", "📊 Performans", "🤖 Bot"])
+    t_radar, t_rank, t_lab, t_perf, t_bot, t_quality = st.tabs(["📡 Radar", "🏆 Sıralama", "🧪 Lab", "📊 Performans", "🤖 Bot", "🛡️ Kalite & Kayıt"])
 
     with t_radar:
         st.caption("1 dk mum: hacim artışı + VWAP/EMA9 üstü + pozitif hacim deltası, henüz fırlamamış hisseler")
@@ -424,6 +443,19 @@ def ui():
             st.info("Veri yok (piyasa kapalı olabilir).")
 
     with t_rank:
+        st.caption("Yeni: Neden işlem yapılmaması gerektiğini açıklayan bağımsız gözlem tablosu. Bid/ask verisi olmadığı için AL tavsiyesi ÜRETMEZ.")
+        if st.button("Adayları ayrıntılı değerlendir"):
+            checks=[]
+            for symbol in wl:
+                try:
+                    bars=get_bars(symbol, 3)
+                    checks.append({"Hisse":symbol, **decision(bars)})
+                except Exception as exc:
+                    checks.append({"Hisse":symbol,"Karar":"VERİ HATASI","Neden":str(exc)[:180]})
+            st.session_state['radar_checks']=checks
+        if st.session_state.get('radar_checks'):
+            st.dataframe(pd.DataFrame(st.session_state['radar_checks']),hide_index=True)
+            st.download_button("Değerlendirmeleri CSV indir", pd.DataFrame(st.session_state['radar_checks']).to_csv(index=False).encode('utf-8-sig'),"radar_degerlendirme.csv","text/csv")
         with st.spinner("Hisseler analiz ediliyor..."):
             sc = scan(tuple(wl), tuple(cfg["strategies"]), stop, take)
         if sc.empty:
@@ -436,6 +468,34 @@ def ui():
             st.dataframe(sc, hide_index=True)
 
     with t_lab:
+        st.caption("Sinyal günlüğü yalnızca bu Streamlit oturumunda saklanır; uygulama yeniden başlarsa silinebilir. CSV olarak indir.")
+        if 'signal_log' not in st.session_state:
+            st.session_state['signal_log']=[]
+        if st.button("Şimdiki gözlemleri günlüğe ekle"):
+            stamp=pd.Timestamp.now(tz='America/New_York')
+            for symbol in wl:
+                try:
+                    bars=get_bars(symbol, 3)
+                    result=decision(bars, stamp)
+                    if result.get('Karar') in ('KIRILIM İZLE / SANAL','DİRENCE YAKIN / SANAL'):
+                        st.session_state['signal_log'].append({'Zaman':stamp,'Hisse':symbol,'Fiyat':result['Fiyat'],'Karar':result['Karar'],'Durum':'BEKLİYOR','5dk %':None})
+                except Exception:
+                    pass
+            st.success('Gözlemler oturum günlüğüne eklendi (varsa).')
+        if st.button("Günlüğü son fiyatlarla değerlendir"):
+            latest={}
+            for symbol in set(x['Hisse'] for x in st.session_state['signal_log'] if x['Durum']=='BEKLİYOR'):
+                try:
+                    bars=closed_bars(get_bars(symbol, 3))
+                    if bars is not None and not bars.empty:
+                        latest[symbol]=(bars.index[-1],float(bars.close.iloc[-1]))
+                except Exception:
+                    pass
+            st.session_state['signal_log']=evaluate_snapshots(st.session_state['signal_log'],latest)
+        if st.session_state['signal_log']:
+            logdf=pd.DataFrame(st.session_state['signal_log'])
+            st.dataframe(logdf,hide_index=True)
+            st.download_button("Sinyal günlüğünü CSV indir",logdf.to_csv(index=False).encode('utf-8-sig'),"sinyal_gunlugu.csv","text/csv")
         sym = st.selectbox("Hisse", wl)
         df = get_bars(sym, 10)
         if df is None:
@@ -454,7 +514,7 @@ def ui():
             p = float(df.close.iloc[-1])
             st.plotly_chart(chart(df, sig, [("Kırılım", lv, "#38bdf8"), ("Stop", p * (1 - stop / 100), "#ef4444"),
                                             ("Hedef", p * (1 + take / 100), "#22c55e")]))
-            st.caption("Backtest son 10 gün, 1 dk IEX mum; varsayımsal işlem maliyeti %0,1. Geçmiş sonuç geleceği garanti etmez.")
+            st.caption("Backtest son 10 gün, 1 dk IEX mum; varsayımsal toplam işlem maliyeti %0,20. Geçmiş sonuç geleceği garanti etmez.")
             if pick == "EMA20/50 Pullback":
                 method = st.radio("Stop yöntemi", ["Swing", "ATR"], horizontal=True)
                 lvls = pullback_levels(df, method)
@@ -502,6 +562,57 @@ def ui():
                              hide_index=True)
         except Exception as e:
             st.error(f"Hesap okunamadı: {e}")
+
+    with t_quality:
+        st.subheader("🛡️ Sinyal doğrulama — gerçek emir verilmez")
+        st.caption("IEX mumları ve IEX bid/ask fiyatları; tüm NASDAQ verisi değildir. Bid/ask bulunmazsa AL kararı verilmez.")
+        if 'quality_log' not in st.session_state:
+            st.session_state['quality_log']=[]
+        if st.button("Güncel adayları doğrula", key='quality_check'):
+            key=secret("ALPACA_KEY",secret("ALPACA_API_KEY"))
+            sec=secret("ALPACA_SECRET",secret("ALPACA_SECRET_KEY"))
+            quotes,err=quote_iex(key,sec,wl)
+            if err: st.warning("Kotasyon hatası: "+err)
+            now=pd.Timestamp.now(tz='America/New_York')
+            rows=[]
+            for symbol in wl:
+                try:
+                    bars=get_bars(symbol,3)
+                    q=quotes.get(symbol)
+                    # Quote must be fresh and not future-dated.
+                    if q and q.get('timestamp'):
+                        qt=pd.Timestamp(q['timestamp']).tz_convert('America/New_York')
+                        if abs((now-qt).total_seconds())>120: q=None
+                    result=assess(bars,now,q)
+                    rows.append({'Hisse':symbol,**result})
+                    if result['Karar'] in ('KIRILIM ADAYI / SANAL','DİRENÇ YAKIN / SANAL') and bars is not None:
+                        completed=closed_bars(bars,now)
+                        stamp=completed.index[-1]
+                        unique=(symbol,str(stamp),result['Karar'])
+                        if not any((r['Hisse'],r['Sinyal mumu'],r['Karar'])==unique for r in st.session_state['quality_log']):
+                            st.session_state['quality_log'].append({'Hisse':symbol,'Sinyal mumu':str(stamp),'Karar':result['Karar'],'Fiyat':result['Fiyat'],'Spread %':result.get('Spread %'),'Hacim x':result.get('Hacim x')})
+                except Exception as exc:
+                    rows.append({'Hisse':symbol,'Karar':'VERİ HATASI','Neden':str(exc)[:200]})
+            st.session_state['quality_rows']=rows
+        if st.session_state.get('quality_rows'):
+            st.dataframe(pd.DataFrame(st.session_state['quality_rows']),hide_index=True)
+            st.download_button('Değerlendirme CSV indir',pd.DataFrame(st.session_state['quality_rows']).to_csv(index=False).encode('utf-8-sig'),'kalite_kontrol.csv','text/csv')
+        st.subheader('İleriye dönük sinyal günlüğü')
+        st.caption('Kayıtlar yalnızca bu oturumda tutulur. 1/5/10/30 dakika için tam hedef mum yoksa sonuç boş kalır; son fiyatla doldurulmaz. İşlem gerçekleşmesi veya net getiri değildir.')
+        if st.button('Sinyal sonuçlarını ölç',key='quality_evaluate'):
+            bars_by_symbol={}
+            for sym in set(r['Hisse'] for r in st.session_state['quality_log']):
+                try:
+                    bars_by_symbol[sym]=closed_bars(get_bars(sym,3))
+                except Exception as exc:
+                    st.warning(f'{sym}: {type(exc).__name__}')
+            st.session_state['quality_log']=evaluate_horizons(st.session_state['quality_log'],bars_by_symbol)
+        if st.session_state['quality_log']:
+            log=pd.DataFrame(st.session_state['quality_log'])
+            st.dataframe(log,hide_index=True)
+            st.download_button('Sinyal günlüğünü CSV indir',log.to_csv(index=False).encode('utf-8-sig'),'ileri_test_sinyalleri.csv','text/csv')
+        else:
+            st.info('Henüz kayıt yok. Normal seans sırasında Güncel adayları doğrula düğmesini kullan.')
 
     with t_bot:
         st.subheader("🛡️ Güvenli test modu")
