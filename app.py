@@ -14,6 +14,8 @@ import plotly.graph_objects as go
 import requests
 from radar_upgrade import discover_symbols, decision, closed_bars, evaluate_snapshots
 from radar_quality import assess, quote_iex, evaluate_horizons, session_state
+from breakout_engine import classify_breakout
+from discovery_engine import fetch_candidates, fetch_asset_map, compare_scans
 import streamlit as st
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -116,10 +118,26 @@ def break_level(df):
 
 
 def s_break(df):
-    """Gerçek kırılım: gövde kapanışla direnç üstünde (fitil değil), güçlü gövde (displacement), hacim onayı."""
+    """Historical closed-bar breakout: causal 20-bar resistance + first crossing + volume/body.
+    Uses same thresholds as the live breakout engine. No pullback counted as breakout.
+    """
+    resistance = break_level(df)
+    prev_resistance = resistance.shift(1)
+    prev_close = df.close.shift(1)
     rng = (df.high - df.low).replace(0, np.nan)
-    return ((df.close > break_level(df) * 1.001) & ((df.close - df.open) / rng > 0.5)
-            & (df.volume > 1.3 * df.volma))
+    tr = pd.concat([(df.high - df.low), (df.high - df.close.shift(1)).abs(),
+                    (df.low - df.close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().shift(1)
+    buffer = (0.10 * atr / resistance).clip(lower=0.0005, upper=0.003)
+    session = pd.Series(df.index.date, index=df.index)
+    session_count = session.groupby(session).cumcount()
+    contiguous = (df.index.to_series().diff().fillna(pd.Timedelta(minutes=1)) <= pd.Timedelta(minutes=2))
+    # Full 20-bar window must be within current session.
+    return ((session_count >= 21) & contiguous &
+            (prev_close <= prev_resistance) & (df.close > resistance * (1 + buffer)) &
+            ((df.close / resistance - 1) <= 0.012) &
+            ((df.close - df.open) / rng >= 0.5) &
+            (df.volume >= 1.5 * df.volma)).fillna(False)
 
 
 def s_fvg(df):
@@ -294,11 +312,13 @@ def analyze(sym, strategies, stop, take):
         why.append(f"Hacim {rvol:.1f}x")
     score = len(active) * 30 + min(rvol, 3) * 10 + (15 if trend else 0) + (10 if last.cdelta > 0 else 0) \
         + (min(float(np.mean(pfs)), 3) * 5 if pfs else 0)
-    # Kırılım doğrulanmadıysa alış tavsiyesi verme.
-    confirmed = any(bool(STRATS[n](df).iloc[-1]) for n in ("Gerçek Kırılım", "EMA20/50 Pullback") if n in strategies)
-    state = "TEYİTLİ / SANAL TEST" if confirmed and rvol >= 1.3 and trend else "İZLE — TEYİT YOK"
+    # One causal breakout engine for all screens. Pullback is NOT a breakout.
+    breakout = classify_breakout(df, now_ny)
+    confirmed = breakout['Kırılım durumu'] == 'TEYİTLİ KIRILIM'
+    state = "TEYİTLİ KIRILIM / SANAL" if confirmed and trend else "İZLE — KIRILIM YOK"
     return {"Durum": state, "Veri yaşı dk": round(age, 1), "Hisse": sym, "Skor": min(100, round(score)), "Fiyat": round(price, 2), "Sinyal": ", ".join(active) or "-",
-            "Hacim x": round(rvol, 1), "Kırılım": round(float(break_level(df).iloc[-1]), 2),
+            "Hacim x": round(rvol, 1), "Kırılım": breakout.get("Direnç"), "Kırılım durumu": breakout["Kırılım durumu"],
+            "Dirence uzaklık %": breakout.get("Dirence uzaklık %"), "Kırılım gerekçesi": breakout["Kırılım gerekçesi"],
             "Alış": round(price, 2), "Stop": round(price * (1 - stop / 100), 2),
             "Hedef": round(price * (1 + take / 100), 2), "Neden": "; ".join(why) or "Belirgin sinyal yok"}
 
@@ -414,20 +434,49 @@ def ui():
     st.subheader("🔎 Dinamik hisse keşfi (deneysel)")
     st.caption("Seans: " + session_state() + " • Sadece normal seans sinyalleri işlem adayı olarak değerlendirilir.")
     st.caption("Alpaca en çok işlem görenler ve yükselenler listesi; veri gecikmesi/kapsamı garanti edilmez. En fazla 20 yeni sembol eklenir. Sadece sanal izleme.")
+    st.caption("Liste aynı kalabilir: bu kaynaklar günün en hareketli hisselerini gösterir; tüm piyasayı taramaz.")
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def validated_assets(api_key, api_secret):
+        return fetch_asset_map(api_key, api_secret)
     if st.button("Yeni adayları keşfet"):
-        with st.spinner("Alpaca tarayıcı listeleri alınıyor..."):
-            found, errors = discover_symbols(secret("ALPACA_KEY", secret("ALPACA_API_KEY")), secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY")))
-        st.session_state['discovered_symbols'] = found
-        st.session_state['discovery_errors'] = errors
-    discovered = st.session_state.get('discovered_symbols', [])
-    if discovered:
-        st.write("Keşfedilen:", ", ".join(discovered))
-    for error in st.session_state.get('discovery_errors', []):
-        st.warning("Keşif erişim sorunu: " + error)
-    use_discovered = st.checkbox("Keşfedilen hisseleri mevcut listeye ekle", value=True)
+        key = secret("ALPACA_KEY", secret("ALPACA_API_KEY"))
+        sec = secret("ALPACA_SECRET", secret("ALPACA_SECRET_KEY"))
+        with st.spinner("Alpaca listeleri ve hisse türleri doğrulanıyor..."):
+            try:
+                assets = validated_assets(key, sec) if key and sec else None
+                scan = fetch_candidates(key, sec, asset_map=assets)
+            except Exception as exc:
+                scan = {'symbols': [], 'details': [], 'rejected': [], 'errors': [f'Doğrulama hatası: {type(exc).__name__}: {str(exc)[:140]}'], 'checked_at_utc': datetime.now(timezone.utc).isoformat()}
+        prior = st.session_state.get('discovery_scan', {}).get('symbols', [])
+        changes = compare_scans(prior, scan['symbols'])
+        scan['changes'] = changes
+        st.session_state['discovery_scan'] = scan
+        history = st.session_state.setdefault('discovery_history', [])
+        history.append({'UTC': scan['checked_at_utc'], 'Bulunan': len(scan['symbols']), 'Yeni': len(changes['new']), 'Çıkan': len(changes['removed']), 'Aynı': len(changes['unchanged'])})
+        st.session_state['discovery_history'] = history[-100:]
+    scan = st.session_state.get('discovery_scan', {})
+    discovered = scan.get('symbols', [])
+    if scan:
+        st.caption(f"Son API denemesi (UTC): {scan.get('checked_at_utc', '?')} • Kaynak: Alpaca movers / most-actives")
+        change = scan.get('changes', {})
+        st.write(f"Yeni: {len(change.get('new', []))} • Çıkan: {len(change.get('removed', []))} • Aynı kalan: {len(change.get('unchanged', []))}")
+        if change.get('new'): st.success('Yeni eklenenler: ' + ', '.join(change['new']))
+        if change.get('removed'): st.info('Listeden çıkanlar: ' + ', '.join(change['removed']))
+        if discovered:
+            st.write('Doğrulanmış normal hisseler: ' + ', '.join(discovered))
+            st.dataframe(pd.DataFrame(scan.get('details', [])), hide_index=True)
+        if scan.get('rejected'):
+            st.caption(f"Normal hisse olarak doğrulanamayan {len(scan['rejected'])} sembol elendi.")
+            with st.expander('Elenen semboller ve nedenleri'):
+                st.dataframe(pd.DataFrame(scan['rejected']), hide_index=True)
+        for err in scan.get('errors', []): st.warning('Keşif sorunu: ' + err)
+        if st.session_state.get('discovery_history'):
+            st.dataframe(pd.DataFrame(st.session_state['discovery_history']), hide_index=True)
+            st.download_button('Keşif geçmişini CSV indir', pd.DataFrame(st.session_state['discovery_history']).to_csv(index=False).encode('utf-8-sig'), 'kesif_gecmisi.csv', 'text/csv')
+    use_discovered = st.checkbox('Keşfedilen hisseleri mevcut listeye ekle', value=True)
     if use_discovered:
         wl = list(dict.fromkeys(wl + discovered))[:35]
-    st.caption(f"Bu oturumda taranacak hisse sayısı: {len(wl)}. Çok sayıda API isteği nedeniyle tarama yavaşlayabilir.")
+    st.caption(f'Bu oturumda taranacak hisse sayısı: {len(wl)}. API istekleri taramayı yavaşlatabilir.')
 
     t_radar, t_rank, t_lab, t_perf, t_bot, t_quality = st.tabs(["📡 Radar", "🏆 Sıralama", "🧪 Lab", "📊 Performans", "🤖 Bot", "🛡️ Kalite & Kayıt"])
 
@@ -443,13 +492,13 @@ def ui():
             st.info("Veri yok (piyasa kapalı olabilir).")
 
     with t_rank:
-        st.caption("Yeni: Neden işlem yapılmaması gerektiğini açıklayan bağımsız gözlem tablosu. Bid/ask verisi olmadığı için AL tavsiyesi ÜRETMEZ.")
+        st.caption("Tek kırılım motoru: 20 önceki mumun direnci, gerçek geçiş, hacim ve mum gövdesi. Bid/ask olmadan AL tavsiyesi üretmez.")
         if st.button("Adayları ayrıntılı değerlendir"):
             checks=[]
             for symbol in wl:
                 try:
                     bars=get_bars(symbol, 3)
-                    checks.append({"Hisse":symbol, **decision(bars)})
+                    checks.append({"Hisse":symbol, **classify_breakout(bars)})
                 except Exception as exc:
                     checks.append({"Hisse":symbol,"Karar":"VERİ HATASI","Neden":str(exc)[:180]})
             st.session_state['radar_checks']=checks
@@ -462,7 +511,7 @@ def ui():
             st.info("Canlı aday yok: piyasa kapalı, veri eski veya son mumda koşullar sağlanmadı. Radar sekmesinde son kapanış verilerini görebilirsin.")
         else:
             for _, r in sc.head(3).iterrows():
-                if r.get("Durum") == "TEYİTLİ / SANAL TEST":
+                if r.get("Durum") == "TEYİTLİ KIRILIM / SANAL":
                     st.success(f"**{r['Hisse']}** (sanal test) skor {r['Skor']} • Alış {r['Alış']} • Stop {r['Stop']} • "
                                f"Hedef {r['Hedef']} • Kırılım {r['Kırılım']}\n\n{r['Neden']}")
             st.dataframe(sc, hide_index=True)
@@ -476,9 +525,9 @@ def ui():
             for symbol in wl:
                 try:
                     bars=get_bars(symbol, 3)
-                    result=decision(bars, stamp)
-                    if result.get('Karar') in ('KIRILIM İZLE / SANAL','DİRENCE YAKIN / SANAL'):
-                        st.session_state['signal_log'].append({'Zaman':stamp,'Hisse':symbol,'Fiyat':result['Fiyat'],'Karar':result['Karar'],'Durum':'BEKLİYOR','5dk %':None})
+                    result=classify_breakout(bars, stamp)
+                    if result.get('Kırılım durumu') in ('TEYİTLİ KIRILIM','DİRENCE YAKIN'):
+                        st.session_state['signal_log'].append({'Zaman':stamp,'Hisse':symbol,'Fiyat':result['Fiyat'],'Karar':result['Kırılım durumu'],'Durum':'BEKLİYOR','5dk %':None})
                 except Exception:
                     pass
             st.success('Gözlemler oturum günlüğüne eklendi (varsa).')
@@ -590,7 +639,7 @@ def ui():
                         stamp=completed.index[-1]
                         unique=(symbol,str(stamp),result['Karar'])
                         if not any((r['Hisse'],r['Sinyal mumu'],r['Karar'])==unique for r in st.session_state['quality_log']):
-                            st.session_state['quality_log'].append({'Hisse':symbol,'Sinyal mumu':str(stamp),'Karar':result['Karar'],'Fiyat':result['Fiyat'],'Spread %':result.get('Spread %'),'Hacim x':result.get('Hacim x')})
+                            st.session_state['quality_log'].append({'Hisse':symbol,'Sinyal mumu':str(stamp),'Karar':result['Kırılım durumu'],'Fiyat':result['Fiyat'],'Spread %':result.get('Spread %'),'Hacim x':result.get('Hacim x')})
                 except Exception as exc:
                     rows.append({'Hisse':symbol,'Karar':'VERİ HATASI','Neden':str(exc)[:200]})
             st.session_state['quality_rows']=rows
