@@ -675,7 +675,10 @@ def ui():
         st.caption("Gerçek alım/satım için Midas'a otomatik bağlantı yoktur. Alpaca hesabına emir gönderilmez.")
 
 
+
 if "--worker" in sys.argv:
     worker()
 else:
+    ui.__globals__["scan"] = globals()["scan"]
     ui()
+
