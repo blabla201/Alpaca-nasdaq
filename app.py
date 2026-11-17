@@ -75,6 +75,29 @@ def notify(msg):
         pass
 
 
+def telegram_send(message):
+    """Send a private Telegram message using Streamlit Secrets; never expose the token."""
+    token = secret("TELEGRAM_BOT_TOKEN")
+    chat_id = secret("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False, "Telegram ayarları eksik: Secrets bölümünü kontrol et."
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": str(chat_id), "text": str(message)[:4000]},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return False, f"Telegram mesajı gönderilemedi (HTTP {response.status_code})."
+        if not response.json().get("ok"):
+            return False, "Telegram mesajı onaylamadı."
+        return True, "Telegram mesajı gönderildi."
+    except requests.RequestException:
+        return False, "Telegram bağlantısı kurulamadı."
+    except ValueError:
+        return False, "Telegram yanıtı okunamadı."
+
+
 # ======================= VERİ + GÖSTERGELER =======================
 def indicators(df):
     d = df.index.date
@@ -481,6 +504,27 @@ def ui():
     if use_discovered:
         wl = list(dict.fromkeys(wl + discovered))[:35]
     st.caption(f'Bu oturumda taranacak hisse sayısı: {len(wl)}. API istekleri taramayı yavaşlatabilir.')
+
+    with st.expander("🔔 Telegram bildirimleri", expanded=False):
+        st.caption("Bu sürümde test mesajı ve manuel radar uyarısı gönderilir. iPhone kapalıyken otomatik tarama henüz etkin değildir.")
+        if st.button("Telegram test mesajı gönder", key="telegram_test"):
+            ok, detail = telegram_send("📈 Alpaca Nasdaq: Telegram bağlantısı başarılı. Bu bir test mesajıdır.")
+            (st.success if ok else st.error)(detail)
+        if st.button("Mevcut radar adaylarını Telegram'a gönder", key="telegram_candidates"):
+            with st.spinner("Güncel adaylar kontrol ediliyor..."):
+                candidates = radar(wl)
+            if candidates.empty:
+                st.info("Radar verisi yok. Bildirim gönderilmedi.")
+            else:
+                matched = candidates[candidates["Durum"].astype(str).str.contains("İzle — ön aday", regex=False)]
+                if matched.empty:
+                    st.info("Şu anda taze ön aday bulunamadı; bildirim gönderilmedi.")
+                else:
+                    lines = ["📡 Alpaca Nasdaq — Ön adaylar (AL sinyali değildir)"]
+                    for _, row in matched.head(10).iterrows():
+                        lines.append(f"{row['Hisse']}: ${row['Fiyat']} | 15 dk %{row['15dk %']} | Hacim {row['Hacim x']}x")
+                    ok, detail = telegram_send("\n".join(lines))
+                    (st.success if ok else st.error)(detail)
 
     t_radar, t_rank, t_lab, t_perf, t_bot, t_quality = st.tabs(["📡 Radar", "🏆 Sıralama", "🧪 Lab", "📊 Performans", "🤖 Bot", "🛡️ Kalite & Kayıt"])
 
