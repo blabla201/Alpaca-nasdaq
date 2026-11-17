@@ -1,5 +1,5 @@
 """
-Lab Nasdaq Bot - tek dosya (app.py)
+Alpaca Nasdaq - uygulama (app.py)
 - iPhone'da Streamlit uygulaması olarak çalışır
 - Aynı dosya GitHub Actions'ta arka plan botu olarak da çalışır:  python app.py --worker
 Yalnızca analiz ve sanal test. Otomatik emirler kapalıdır.
@@ -70,7 +70,7 @@ def notify(msg):
         return
     try:
         requests.post(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
-                      headers={"Title": "Lab Nasdaq"}, timeout=8)
+                      headers={"Title": "Alpaca Nasdaq"}, timeout=8)
     except Exception:
         pass
 
@@ -324,7 +324,7 @@ def analyze(sym, strategies, stop, take):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def scan(wl, strategies, stop, take):
+def scan_stocks(wl, strategies, stop, take):
     rows = []
     for s in wl:
         try:
@@ -340,7 +340,11 @@ def radar(wl):
     """Ani hareket radarı (1 dk mum): henüz fırlamamış ama yükselme belirtisi gösterenler."""
     rows = []
     for s in wl:
-        df = get_bars(s, 5)
+        try:
+            df = get_bars(s, 5)
+        except Exception:
+            # Tek bir semboldeki API hatası tüm radarı durdurmasın.
+            continue
         if df is None or len(df) < 30:
             continue
         now_ny = pd.Timestamp.now(tz="America/New_York")
@@ -403,7 +407,7 @@ def chart(df, sig=None, lines=None):
 
 
 def ui():
-    st.set_page_config(page_title="Lab Nasdaq", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Alpaca Nasdaq", page_icon="📈", layout="wide")
     pin = secret("APP_PIN")
     if pin and not st.session_state.get("ok"):
         x = st.text_input("PIN", type="password")
@@ -415,7 +419,7 @@ def ui():
         st.error("ALPACA_KEY ve ALPACA_SECRET Streamlit Secrets'a eklenmeli.")
         st.stop()
 
-    st.title("📈 Lab Nasdaq v6.8 — Doğrulama Radarı")
+    st.title("📈 Alpaca Nasdaq v7.1 — Kararlı Tarama")
     st.warning("IEX tek borsa verisidir; tüm NASDAQ hacmi değildir. Buradaki sinyaller gerçek alım önerisi değil, test adaylarıdır.")
     st.caption(("🧪 SANAL (paper) hesap" if PAPER else "⚠️ CANLI hesap") + " • Yatırım tavsiyesi değildir")
 
@@ -444,32 +448,32 @@ def ui():
         with st.spinner("Alpaca listeleri ve hisse türleri doğrulanıyor..."):
             try:
                 assets = validated_assets(key, sec) if key and sec else None
-                scan = fetch_candidates(key, sec, asset_map=assets)
+                discovery_result = fetch_candidates(key, sec, asset_map=assets)
             except Exception as exc:
-                scan = {'symbols': [], 'details': [], 'rejected': [], 'errors': [f'Doğrulama hatası: {type(exc).__name__}: {str(exc)[:140]}'], 'checked_at_utc': datetime.now(timezone.utc).isoformat()}
+                discovery_result = {'symbols': [], 'details': [], 'rejected': [], 'errors': [f'Doğrulama hatası: {type(exc).__name__}: {str(exc)[:140]}'], 'checked_at_utc': datetime.now(timezone.utc).isoformat()}
         prior = st.session_state.get('discovery_scan', {}).get('symbols', [])
-        changes = compare_scans(prior, scan['symbols'])
-        scan['changes'] = changes
-        st.session_state['discovery_scan'] = scan
+        changes = compare_scans(prior, discovery_result['symbols'])
+        discovery_result['changes'] = changes
+        st.session_state['discovery_scan'] = discovery_result
         history = st.session_state.setdefault('discovery_history', [])
-        history.append({'UTC': scan['checked_at_utc'], 'Bulunan': len(scan['symbols']), 'Yeni': len(changes['new']), 'Çıkan': len(changes['removed']), 'Aynı': len(changes['unchanged'])})
+        history.append({'UTC': discovery_result['checked_at_utc'], 'Bulunan': len(discovery_result['symbols']), 'Yeni': len(changes['new']), 'Çıkan': len(changes['removed']), 'Aynı': len(changes['unchanged'])})
         st.session_state['discovery_history'] = history[-100:]
-    scan = st.session_state.get('discovery_scan', {})
-    discovered = scan.get('symbols', [])
-    if scan:
-        st.caption(f"Son API denemesi (UTC): {scan.get('checked_at_utc', '?')} • Kaynak: Alpaca movers / most-actives")
-        change = scan.get('changes', {})
+    discovery_result = st.session_state.get('discovery_scan', {})
+    discovered = discovery_result.get('symbols', [])
+    if discovery_result:
+        st.caption(f"Son API denemesi (UTC): {discovery_result.get('checked_at_utc', '?')} • Kaynak: Alpaca movers / most-actives")
+        change = discovery_result.get('changes', {})
         st.write(f"Yeni: {len(change.get('new', []))} • Çıkan: {len(change.get('removed', []))} • Aynı kalan: {len(change.get('unchanged', []))}")
         if change.get('new'): st.success('Yeni eklenenler: ' + ', '.join(change['new']))
         if change.get('removed'): st.info('Listeden çıkanlar: ' + ', '.join(change['removed']))
         if discovered:
             st.write('Doğrulanmış normal hisseler: ' + ', '.join(discovered))
-            st.dataframe(pd.DataFrame(scan.get('details', [])), hide_index=True)
-        if scan.get('rejected'):
-            st.caption(f"Normal hisse olarak doğrulanamayan {len(scan['rejected'])} sembol elendi.")
+            st.dataframe(pd.DataFrame(discovery_result.get('details', [])), hide_index=True)
+        if discovery_result.get('rejected'):
+            st.caption(f"Normal hisse olarak doğrulanamayan {len(discovery_result['rejected'])} sembol elendi.")
             with st.expander('Elenen semboller ve nedenleri'):
-                st.dataframe(pd.DataFrame(scan['rejected']), hide_index=True)
-        for err in scan.get('errors', []): st.warning('Keşif sorunu: ' + err)
+                st.dataframe(pd.DataFrame(discovery_result['rejected']), hide_index=True)
+        for err in discovery_result.get('errors', []): st.warning('Keşif sorunu: ' + err)
         if st.session_state.get('discovery_history'):
             st.dataframe(pd.DataFrame(st.session_state['discovery_history']), hide_index=True)
             st.download_button('Keşif geçmişini CSV indir', pd.DataFrame(st.session_state['discovery_history']).to_csv(index=False).encode('utf-8-sig'), 'kesif_gecmisi.csv', 'text/csv')
@@ -506,7 +510,7 @@ def ui():
             st.dataframe(pd.DataFrame(st.session_state['radar_checks']),hide_index=True)
             st.download_button("Değerlendirmeleri CSV indir", pd.DataFrame(st.session_state['radar_checks']).to_csv(index=False).encode('utf-8-sig'),"radar_degerlendirme.csv","text/csv")
         with st.spinner("Hisseler analiz ediliyor..."):
-            sc = scan(tuple(wl), tuple(cfg["strategies"]), stop, take)
+            sc = scan_stocks(tuple(wl), tuple(cfg["strategies"]), stop, take)
         if sc.empty:
             st.info("Canlı aday yok: piyasa kapalı, veri eski veya son mumda koşullar sağlanmadı. Radar sekmesinde son kapanış verilerini görebilirsin.")
         else:
@@ -667,7 +671,7 @@ def ui():
         st.subheader("🛡️ Güvenli test modu")
         st.info("Otomatik emir verme kapalı. Önce yeterli sayıda tarihsel ve ileriye dönük testte maliyet sonrası pozitif sonuç gerekli.")
         if st.button("Sanal sinyal taramasını çalıştır"):
-            sc = scan(tuple(wl), tuple(cfg["strategies"]), stop, take)
+            sc = scan_stocks(tuple(wl), tuple(cfg["strategies"]), stop, take)
             if sc.empty:
                 st.warning("Güncel teyitli sinyal yok veya piyasa kapalı.")
             else:
@@ -675,10 +679,7 @@ def ui():
         st.caption("Gerçek alım/satım için Midas'a otomatik bağlantı yoktur. Alpaca hesabına emir gönderilmez.")
 
 
-
 if "--worker" in sys.argv:
     worker()
 else:
-    ui.__globals__["scan"] = globals()["scan"]
     ui()
-
